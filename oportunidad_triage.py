@@ -1,142 +1,107 @@
 import pandas as pd
-import numpy as np
 
-# =========================================
+# --------------------------------------------------
 # CONFIGURACIÓN
-# =========================================
+# --------------------------------------------------
+VENTANA_MINUTOS = 10   # ventana para considerar médico ocupado
 
-RUTA_INGRESOS = "Ingresos_Consultorios.csv"
-RUTA_EVOLUCIONES = "medicos_evoluciones.csv"
-
-MEDICO_VISIBLE = None  
-# Escriba el nombre exacto si desea dejar uno visible.
-# Ejemplo:
-# MEDICO_VISIBLE = ""
-
-# =========================================
-# CARGA
-# =========================================
-
-ingresos = pd.read_csv(
-    RUTA_INGRESOS,
+# --------------------------------------------------
+# 1. CARGAR TRIAGE
+# --------------------------------------------------
+triage = pd.read_csv(
+    "hora_triage_consulta.csv",
     sep="\t",
-    encoding="latin1",
-    parse_dates=["fechaingreso", "fecha_consulta"]
+    encoding="latin1"
 )
 
-evoluciones = pd.read_csv(
-    RUTA_EVOLUCIONES,
-    sep="\t",
-    encoding="latin1",
-    parse_dates=["fecha_evolucion"]
-)
-
-# =========================================
-# FILTRO SERVICIO
-# =========================================
-
-ingresos = ingresos[
-    ingresos["departamento_ingreso"] == "URGENCIAS CONSULTORIOS Y PROCEDIMIENTOS"
-].copy()
-
-# Asegurar ingreso como texto
-ingresos["ingreso"] = ingresos["ingreso"].astype(str)
-evoluciones["ingreso"] = evoluciones["ingreso"].astype(str)
-
-# =========================================
-# TIEMPO DE ESPERA
-# =========================================
-
-ingresos["duracion"] = ingresos["fecha_consulta"] - ingresos["fechaingreso"]
-ingresos["minutos_espera"] = ingresos["duracion"].dt.total_seconds() / 60
-
-# =========================================
-# FUNCIÓN BUSCAR EVOLUCIONES EN ESPERA
-# =========================================
-
-def buscar_evoluciones(row):
-    
-    if row["minutos_espera"] <= 20:
-        return "No aplica (≤20 min)"
-    
-    inicio = row["fechaingreso"]
-    fin = row["fecha_consulta"]
-    medico = row["medico"]
-    
-    evos = evoluciones[
-        (evoluciones["medico"] == medico) &
-        (evoluciones["fecha_evolucion"] >= inicio) &
-        (evoluciones["fecha_evolucion"] <= fin)
-    ]
-    
-    if evos.empty:
-        return "Sin evoluciones en ese intervalo"
-    
-    fechas = evos["fecha_evolucion"].dt.strftime("%Y-%b-%d %H:%M:%S").tolist()
-    return " | ".join(fechas)
-
-# Aplicar
-ingresos["evoluciones_en_espera"] = ingresos.apply(buscar_evoluciones, axis=1)
-
-# =========================================
-# FORMATO DE FECHAS
-# =========================================
-
-ingresos["fechaingreso"] = ingresos["fechaingreso"].dt.strftime("%Y-%b-%d %H:%M:%S")
-ingresos["fecha_consulta"] = ingresos["fecha_consulta"].dt.strftime("%Y-%b-%d %H:%M:%S")
-
-# =========================================
-# ANONIMIZACIÓN OPCIONAL
-# =========================================
-
-if MEDICO_VISIBLE:
-
-    medicos = (
-        ingresos.loc[ingresos["medico"] != MEDICO_VISIBLE, "medico"]
-        .dropna()
-        .unique()
-    )
-
-    mapa_anon = {medico: f"medico{i+1}" for i, medico in enumerate(medicos)}
-
-    ingresos["medico"] = ingresos["medico"].apply(
-        lambda x: x if x == MEDICO_VISIBLE else mapa_anon.get(x, x)
-    )
-
-# =========================================
-# TABLA FINAL
-# =========================================
-
-columnas_finales = [
-    "ingreso",
-    "plan_descripcion",
-    "medico",
-    "fechaingreso",
-    "fecha_consulta",
-    "minutos_espera",
-    "evoluciones_en_espera"
+columnas = [
+    "triage_id","fecha_clasificacion","tiempo_clasificacion",
+    "triage_descripcion","profesional_atiende","evolucion_id"
 ]
 
-tabla_final = ingresos[columnas_finales].copy()
+triage = triage[columnas]
+triage = triage[triage["triage_descripcion"] != "NINGUNO"]
+triage = triage.drop_duplicates(subset="triage_id")
 
-display(tabla_final)
+triage["fecha_clasificacion"] = pd.to_datetime(triage["fecha_clasificacion"], errors="coerce")
+triage["tiempo_clasificacion"] = pd.to_timedelta(triage["tiempo_clasificacion"], errors="coerce")
+triage["tiempo_clasificacion_min"] = triage["tiempo_clasificacion"].dt.total_seconds() / 60
 
-# =========================================
-# PROMEDIOS
-# =========================================
-
-promedio_general = tabla_final["minutos_espera"].mean()
-
-promedio_por_medico = (
-    tabla_final
-    .groupby("medico")["minutos_espera"]
-    .mean()
-    .reset_index()
-    .sort_values("minutos_espera", ascending=False)
+# --------------------------------------------------
+# 2. CARGAR EVOLUCIONES MÉDICAS
+# --------------------------------------------------
+evo = pd.read_csv(
+    "medicos_evoluciones.csv",
+    sep="\t",
+    encoding="latin1"
 )
 
-print("\nPROMEDIO GENERAL DE MINUTOS DE ESPERA:")
-print(round(promedio_general, 2))
+evo = evo.drop(columns=["usuario_id"], errors="ignore")
 
-print("\nPROMEDIO DE MINUTOS DE ESPERA POR MÉDICO:")
-display(promedio_por_medico)
+evo = evo[
+    (evo["especialidad"] == "MEDICINA GENERAL") &
+    (
+        (evo["departamento"] == "URGENCIAS CONSULTORIOS Y PROCEDIMIENTOS") |
+        (evo["departamento"] == "URGENCIAS OBSERVACION ADULTOS") |
+        (evo["departamento"] == "URGENCIAS OBSERVACION PEDIATRIA")
+    )
+]
+
+evo = evo.drop(columns=[
+    "hallazgo_subjetivo","hallazgo_objetivo",
+    "justificacion_hospitalizacion","descripcion",
+    "t_id","id_paciente","nombre_paciente"
+], errors="ignore")
+
+evo["fecha_evolucion"] = pd.to_datetime(evo["fecha_evolucion"], errors="coerce")
+
+# --------------------------------------------------
+# 3. FUNCIÓN PARA SABER QUÉ HACÍA EL MÉDICO
+# --------------------------------------------------
+def actividad_medico(fila):
+
+    tiempo = fila["tiempo_clasificacion_min"]
+
+    # si no supera 10 minutos no investigar
+    if pd.isna(tiempo) or tiempo <= 10:
+        return "OK"
+
+    medico = fila["profesional_atiende"]
+    momento_triage = fila["fecha_clasificacion"]
+
+    if pd.isna(momento_triage):
+        return "SIN FECHA TRIAGE"
+
+    ventana_inicio = momento_triage - pd.Timedelta(minutes=VENTANA_MINUTOS)
+    ventana_fin = momento_triage + pd.Timedelta(minutes=VENTANA_MINUTOS)
+
+    evoluciones_medico = evo[evo["medico"] == medico]
+
+    ocupaciones = evoluciones_medico[
+        (evoluciones_medico["fecha_evolucion"] >= ventana_inicio) &
+        (evoluciones_medico["fecha_evolucion"] <= ventana_fin)
+    ]
+
+    if len(ocupaciones) == 0:
+        return "SIN REGISTRO DE ACTIVIDAD"
+
+    # describir qué estaba haciendo
+    detalles = ocupaciones.apply(
+        lambda r: f"Evolución paciente ingreso {r['ingreso']} ({r['fecha_evolucion']})",
+        axis=1
+    )
+
+    return " | ".join(detalles)
+
+# --------------------------------------------------
+# 4. CREAR NUEVA COLUMNA
+# --------------------------------------------------
+triage["actividad_medico_si_demora"] = triage.apply(actividad_medico, axis=1)
+
+# --------------------------------------------------
+# 5. GUARDAR RESULTADO
+# --------------------------------------------------
+triage.to_csv("triage_con_actividad_medica.csv", index=False)
+
+print("\nArchivo generado: triage_con_actividad_medica.csv")
+print(triage.head())
