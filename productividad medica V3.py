@@ -1,12 +1,13 @@
-# horas_medicos.py
 import csv
 import re
 import pandas as pd
 
 EVOLUCIONES_PATH = "medicos_evoluciones.csv"
 CONSULTAS_PATH   = "Ingresos_Consultorios.csv"
+CIRUGIAS_PATH    = "ReporteCirugiaUrosdesde031219.csv"
 
-# Huecos mayores a este umbral se consideran "horas muertas" y no suman.
+# Huecos mayores a este umbral se consideran "horas muertas" y no suman
+# (aplica solo entre eventos puntuales; las cirugías se suman siempre completas).
 UMBRAL_MINUTOS = 60
 
 
@@ -24,8 +25,20 @@ def _leer_tsv(path: str) -> pd.DataFrame:
     )
 
 
+def _parse_fecha_es(series: pd.Series) -> pd.Series:
+    """Parsea fechas tipo '17/09/2026 5:30:00 p. m.'."""
+    s = series.astype(str).str.strip()
+    s = s.str.replace(r"p\.\s*m\.", "PM", regex=True, flags=re.IGNORECASE)
+    s = s.str.replace(r"a\.\s*m\.", "AM", regex=True, flags=re.IGNORECASE)
+    s = s.str.replace(r"\s+", " ", regex=True).str.strip()
+    return pd.to_datetime(s, format="%d/%m/%Y %I:%M:%S %p", errors="coerce")
+
+
+# ---------------------------------------------------------------------------
+# Carga de fuentes
+# ---------------------------------------------------------------------------
 def cargar_eventos() -> pd.DataFrame:
-    """Une evoluciones + consultas en una sola tabla de eventos."""
+    """Une evoluciones + consultas en una sola tabla de eventos (puntos en el tiempo)."""
     # --- Evoluciones ---
     ev = _leer_tsv(EVOLUCIONES_PATH)
     ev["timestamp"] = pd.to_datetime(ev["fecha_evolucion"], errors="coerce")
@@ -41,7 +54,6 @@ def cargar_eventos() -> pd.DataFrame:
     hc = pd.to_timedelta(
         co["hora_consulta"].replace("", pd.NA), errors="coerce"
     )
-    # Si hora_consulta viene informada, se combina con la fecha; si no, se usa la fecha sola.
     co["timestamp"] = fc.where(hc.isna(), fc.dt.normalize() + hc)
 
     dep_act = co["departamento_actual"].fillna("")
@@ -67,14 +79,49 @@ def cargar_eventos() -> pd.DataFrame:
     return eventos
 
 
+def cargar_cirugias() -> pd.DataFrame:
+    """
+    Carga cirugías y retorna intervalos de ocupación por médico AYUDANTE:
+        medico, departamento, fecha, inicio, fin
+    - medico        = nombre_ayudante
+    - departamento  = especialidad (fallback: 'CIRUGIA')
+    - fecha         = día de hora_inicio
+    """
+    vacio = pd.DataFrame(columns=["medico", "departamento", "fecha", "inicio", "fin"])
+    try:
+        ci = _leer_tsv(CIRUGIAS_PATH)
+    except FileNotFoundError:
+        print(f"[aviso] No se encontró {CIRUGIAS_PATH}; se omite ocupación por cirugías.")
+        return vacio
+
+    if "nombre_ayudante" not in ci.columns:
+        print("[aviso] El archivo de cirugías no contiene 'nombre_ayudante'.")
+        return vacio
+
+    ci["inicio"] = _parse_fecha_es(ci["hora_inicio"])
+    ci["fin"]    = _parse_fecha_es(ci["hora_fin"])
+
+    # Departamento = especialidad de la cirugía (fallback genérico)
+    esp = ci.get("especialidad", pd.Series([""] * len(ci), index=ci.index))
+    esp = esp.fillna("").astype(str).str.strip()
+    ci["departamento"] = esp.where(esp != "", "CIRUGIA")
+
+    # Médico ayudante
+    ci["medico"] = ci["nombre_ayudante"].fillna("").astype(str).str.strip()
+
+    # Limpieza
+    ci = ci.dropna(subset=["inicio", "fin"])
+    ci = ci[ci["medico"] != ""]
+    ci = ci[ci["fin"] >= ci["inicio"]]
+    ci["fecha"] = ci["inicio"].dt.date
+
+    return ci[["medico", "departamento", "fecha", "inicio", "fin"]].reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # Selección múltiple por consola
 # ---------------------------------------------------------------------------
 def _parsear_seleccion(texto: str, n: int) -> list[int] | None:
-    """
-    Acepta: '*' o Enter -> todos; '1,3,5' -> sueltos; '2-5' -> rango; combinaciones.
-    Devuelve lista de índices 1-based o None (todos).
-    """
     texto = texto.strip()
     if texto in ("", "*"):
         return None
@@ -106,23 +153,35 @@ def elegir_multi(prompt: str, opciones: list[str]) -> list[str] | None:
 
 
 # ---------------------------------------------------------------------------
-# Cálculo de horas activas descontando huecos
+# Cálculo de horas activas descontando huecos + cirugías (ayudante)
 # ---------------------------------------------------------------------------
-def _horas_activas(ts_series: pd.Series, umbral_min: int) -> tuple[float, float]:
-    """Retorna (horas_activas, horas_span)."""
+def _intervalos_desde_eventos(ts_series: pd.Series, umbral_min: int):
+    """Intervalos entre eventos consecutivos con hueco <= umbral."""
     ts = ts_series.sort_values().reset_index(drop=True)
-    if len(ts) < 2:
-        return 0.0, 0.0
-    total = 0.0
+    intervals = []
     for i in range(1, len(ts)):
         gap = (ts[i] - ts[i - 1]).total_seconds()
         if gap <= umbral_min * 60:
-            total += gap
-    span = (ts.iloc[-1] - ts.iloc[0]).total_seconds()
-    return total / 3600, span / 3600
+            intervals.append((ts[i - 1], ts[i]))
+    return intervals
+
+
+def _merge_intervalos(intervals):
+    """Fusiona intervalos solapados (evita doble conteo con cirugías)."""
+    if not intervals:
+        return []
+    intervals = sorted(intervals, key=lambda x: x[0])
+    merged = [list(intervals[0])]
+    for s, e in intervals[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return merged
 
 
 def horas_por_dia(eventos: pd.DataFrame,
+                  cirugias: pd.DataFrame | None = None,
                   medicos: list[str] | None = None,
                   departamentos: list[str] | None = None,
                   umbral_min: int = UMBRAL_MINUTOS) -> pd.DataFrame:
@@ -131,27 +190,77 @@ def horas_por_dia(eventos: pd.DataFrame,
         d = d[d["medico"].isin(medicos)]
     if departamentos:
         d = d[d["departamento"].isin(departamentos)]
-    if d.empty:
+
+    if cirugias is None:
+        c = pd.DataFrame(columns=["medico", "departamento", "fecha", "inicio", "fin"])
+    else:
+        c = cirugias.copy()
+        if medicos:
+            c = c[c["medico"].isin(medicos)]
+        if departamentos:
+            c = c[c["departamento"].isin(departamentos)]
+
+    if d.empty and c.empty:
         return pd.DataFrame()
 
+    # Claves (médico, depto, fecha) presentes en cualquiera de las dos fuentes
+    keys: set = set()
+    if not d.empty:
+        keys.update(d[["medico", "departamento", "fecha"]]
+                    .itertuples(index=False, name=None))
+    if not c.empty:
+        keys.update(c[["medico", "departamento", "fecha"]]
+                    .itertuples(index=False, name=None))
+
     filas = []
-    for (med, dep, fecha), g in d.groupby(["medico", "departamento", "fecha"]):
-        horas_act, span = _horas_activas(g["timestamp"], umbral_min)
+    for med, dep, fecha in sorted(keys):
+        eg = d[(d["medico"] == med) &
+               (d["departamento"] == dep) &
+               (d["fecha"] == fecha)] if not d.empty else d
+        cg = c[(c["medico"] == med) &
+               (c["departamento"] == dep) &
+               (c["fecha"] == fecha)] if not c.empty else c
+
+        # Intervalos "activos": huecos entre eventos + cirugías completas
+        intervals: list[tuple] = []
+        if not eg.empty:
+            intervals.extend(_intervalos_desde_eventos(eg["timestamp"], umbral_min))
+        for _, row in cg.iterrows():
+            intervals.append((row["inicio"], row["fin"]))
+
+        # Span = primer a último timestamp (eventos + cirugías)
+        all_ts = []
+        if not eg.empty:
+            all_ts.extend(eg["timestamp"].tolist())
+        if not cg.empty:
+            all_ts.extend(cg["inicio"].tolist())
+            all_ts.extend(cg["fin"].tolist())
+        if not all_ts:
+            continue
+
+        span = (max(all_ts) - min(all_ts)).total_seconds() / 3600
+
+        if intervals:
+            merged = _merge_intervalos(intervals)
+            horas_act = sum((e - s).total_seconds() for s, e in merged) / 3600
+        else:
+            horas_act = 0.0
+
         filas.append({
-            "medico":          med,
-            "departamento":    dep,
-            "fecha":           fecha,
-            "primera_atencion": g["timestamp"].min(),
-            "ultima_atencion":  g["timestamp"].max(),
-            "n_evoluciones":   int((g["fuente"] == "evolucion").sum()),
-            "n_consultas":     int((g["fuente"] == "consulta").sum()),
-            "horas_span":      span,
-            "horas_muertas":   max(span - horas_act, 0.0),
-            "horas":           horas_act,
+            "medico":           med,
+            "departamento":     dep,
+            "fecha":            fecha,
+            "primera_atencion": min(all_ts),
+            "ultima_atencion":  max(all_ts),
+            "n_evoluciones":    int((eg["fuente"] == "evolucion").sum()) if not eg.empty else 0,
+            "n_consultas":      int((eg["fuente"] == "consulta").sum())   if not eg.empty else 0,
+            "n_cirugias":       int(len(cg)),
+            "horas_span":       span,
+            "horas_muertas":    max(span - horas_act, 0.0),
+            "horas":            horas_act,
         })
 
     res = pd.DataFrame(filas)
-    # Redondeo a enteros
     for col in ("horas", "horas_span", "horas_muertas"):
         res[col] = res[col].round().astype(int)
 
@@ -162,27 +271,36 @@ def horas_por_dia(eventos: pd.DataFrame,
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    eventos = cargar_eventos()
+    eventos  = cargar_eventos()
+    cirugias = cargar_cirugias()
 
-    medicos       = sorted(eventos["medico"].dropna().unique().tolist())
-    departamentos = sorted(eventos["departamento"].dropna().unique().tolist())
+    medicos = sorted(
+        set(eventos["medico"].dropna().unique().tolist())
+        | set(cirugias["medico"].dropna().unique().tolist())
+    )
+    departamentos = sorted(
+        set(eventos["departamento"].dropna().unique().tolist())
+        | set(cirugias["departamento"].dropna().unique().tolist())
+    )
 
     medicos_sel = elegir_multi("Médicos disponibles", medicos)
     deps_sel    = elegir_multi("Departamentos disponibles", departamentos)
 
-    res = horas_por_dia(eventos, medicos_sel, deps_sel)
+    res = horas_por_dia(eventos, cirugias, medicos_sel, deps_sel)
 
     if res.empty:
         print("\nNo hay datos para la selección.")
         return
 
     print(f"\n=== Horas por día (enteras, huecos > {UMBRAL_MINUTOS} min descontados) ===")
+    print("    Incluye ocupación por cirugías como ayudante (hora_fin - hora_inicio)")
     print(res.to_string(index=False))
 
     print("\n=== Totales por médico ===")
     total = (res.groupby("medico", as_index=False)
                 .agg(horas=("horas", "sum"),
-                     horas_muertas=("horas_muertas", "sum"))
+                     horas_muertas=("horas_muertas", "sum"),
+                     n_cirugias=("n_cirugias", "sum"))
                 .sort_values("horas", ascending=False))
     print(total.to_string(index=False))
 
